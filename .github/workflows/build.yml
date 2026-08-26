@@ -12,8 +12,14 @@ jobs:
       contents: read
       packages: write
     steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
       - name: Clone upstream crw source
         run: git clone --depth 1 https://github.com/us/crw.git upstream
+
+      - name: Apply camoufox challenge-wait patch
+        run: git -C upstream apply --verbose ../wait-for-challenge.patch
 
       - name: Record upstream commit
         id: upstream
