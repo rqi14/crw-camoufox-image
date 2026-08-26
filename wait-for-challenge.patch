@@ -1,8 +1,97 @@
+diff --git a/config.default.toml b/config.default.toml
+index b659c43..6ab05f9 100644
+--- a/config.default.toml
++++ b/config.default.toml
+@@ -66,6 +66,7 @@ ws_url = "ws://127.0.0.1:9222/"
+ # api_key = ""                 # optional bearer token if the sidecar is protected
+ # include_in_auto = false      # default: stay out of the auto ladder
+ # camoufox_timeout_ms = 60000  # optional per-request REST budget override
++# camoufox_challenge_wait_ms = 20000  # ceiling for polling a tab while a CF-style JS challenge clears
+ 
+ [crawler]
+ max_concurrency = 10
+diff --git a/crates/crw-core/src/config.rs b/crates/crw-core/src/config.rs
+index 63fc667..2c850e7 100644
+--- a/crates/crw-core/src/config.rs
++++ b/crates/crw-core/src/config.rs
+@@ -221,6 +221,12 @@ pub const MAX_WAIT_FOR_MS: u64 = 60_000;
+ /// and must never be charged CDP overhead.
+ pub const CAMOUFOX_DEFAULT_TIMEOUT_MS: u64 = 60_000;
+ 
++/// Default ceiling (ms) for polling a Camoufox tab while a Cloudflare-style JS
++/// challenge resolves, before giving up and reporting a bot wall. Empirically
++/// ~5-25s depending on target; 20s covers the common case without eating most
++/// of the request deadline. Used by [`RendererConfig::camoufox_challenge_wait`].
++pub const CAMOUFOX_DEFAULT_CHALLENGE_WAIT_MS: u64 = 20_000;
++
+ /// Default cloak (Turnstile-solver sidecar) per-request budget (ms) — the
+ /// per-attempt solve budget bounding one sidecar mirror call. A cold interactive
+ /// Turnstile solve is ~21s; 35s leaves margin for the browser solve + curl_cffi
+@@ -803,6 +809,12 @@ pub struct RendererConfig {
+     /// [`CAMOUFOX_DEFAULT_TIMEOUT_MS`] when unset.
+     #[serde(default)]
+     pub camoufox_timeout_ms: Option<u64>,
++    /// Ceiling (ms) for polling a Camoufox tab while a bot-challenge wall
++    /// clears, before giving up. Falls back to
++    /// [`CAMOUFOX_DEFAULT_CHALLENGE_WAIT_MS`] when unset. Env var:
++    /// `CRW_RENDERER__CAMOUFOX_CHALLENGE_WAIT_MS`.
++    #[serde(default)]
++    pub camoufox_challenge_wait_ms: Option<u64>,
+     /// Opt-in cloak Turnstile-solver sidecar endpoint. See [`CloakEndpoint`].
+     /// `None` = not configured (default) → the tier is never constructed and the
+     /// engine is byte-identical to a build without it. Fired only as a
+@@ -1080,6 +1092,7 @@ impl Default for RendererConfig {
+             chrome_proxy_timeout_ms: None,
+             camoufox: None,
+             camoufox_timeout_ms: None,
++            camoufox_challenge_wait_ms: None,
+             cloak: None,
+             cloak_timeout_ms: None,
+             cloak_proxy_host: None,
+@@ -1133,6 +1146,10 @@ impl RendererConfig {
+         self.camoufox_timeout_ms
+             .unwrap_or(CAMOUFOX_DEFAULT_TIMEOUT_MS)
+     }
++    pub fn camoufox_challenge_wait(&self) -> u64 {
++        self.camoufox_challenge_wait_ms
++            .unwrap_or(CAMOUFOX_DEFAULT_CHALLENGE_WAIT_MS)
++    }
+     /// Per-attempt cloak solve budget (ms). Unconditional (no `#[cfg]`) so
+     /// `tier_timeouts_from` can reference it in every build, like
+     /// [`Self::camoufox_timeout`].
 diff --git a/crates/crw-renderer/src/camoufox.rs b/crates/crw-renderer/src/camoufox.rs
-index 370fc16..8ba835b 100644
+index 370fc16..9f2fbc7 100644
 --- a/crates/crw-renderer/src/camoufox.rs
 +++ b/crates/crw-renderer/src/camoufox.rs
-@@ -230,7 +230,21 @@ impl CamoufoxRenderer {
+@@ -50,16 +50,26 @@ pub struct CamoufoxRenderer {
+     api_key: String,
+     /// Overall per-request REST budget (`config.camoufox_timeout()`).
+     timeout: Duration,
++    /// Ceiling for polling a tab while a bot-challenge wall clears
++    /// (`config.camoufox_challenge_wait()`).
++    challenge_wait: Duration,
+     client: reqwest::Client,
+ }
+ 
+ impl CamoufoxRenderer {
+-    pub fn new(name: &str, base_url: &str, api_key: &str, timeout_ms: u64) -> Self {
++    pub fn new(
++        name: &str,
++        base_url: &str,
++        api_key: &str,
++        timeout_ms: u64,
++        challenge_wait_ms: u64,
++    ) -> Self {
+         Self {
+             name: name.to_string(),
+             base_url: base_url.trim_end_matches('/').to_string(),
+             api_key: api_key.to_string(),
+             timeout: Duration::from_millis(timeout_ms),
++            challenge_wait: Duration::from_millis(challenge_wait_ms),
+             client: reqwest::Client::new(),
+         }
+     }
+@@ -230,7 +240,24 @@ impl CamoufoxRenderer {
          deadline: &Deadline,
      ) -> CrwResult<(u16, String)> {
          let tab_id = self.create_tab(url, user_id, session_key, deadline).await?;
@@ -11,9 +100,12 @@ index 370fc16..8ba835b 100644
 +        // Cloudflare-style JS challenges resolve client-side, empirically
 +        // taking up to ~20-25s. A single immediate evaluate() only ever sees
 +        // the interstitial. Poll until the wall clears or a bounded budget
-+        // runs out, capped well under the request deadline so a hung
-+        // challenge can't consume the caller's whole budget.
-+        let challenge_budget = Duration::from_secs(30).min(deadline.remaining());
++        // runs out (config.camoufox_challenge_wait_ms — tunable via
++        // CRW_RENDERER__CAMOUFOX_CHALLENGE_WAIT_MS, no rebuild needed), capped
++        // well under the request deadline so a hung challenge can't consume
++        // the caller's whole budget. A clean page never hits the loop at all:
++        // looks_like_wall is None on the first evaluate.
++        let challenge_budget = self.challenge_wait.min(deadline.remaining());
 +        let poll_start = Instant::now();
 +        let mut html = self.evaluate_outer_html(&tab_id, user_id, deadline).await?;
 +        while looks_like_wall(&html).is_some() && poll_start.elapsed() < challenge_budget {
@@ -25,3 +117,35 @@ index 370fc16..8ba835b 100644
          // A bot wall or an empty body is a failure for THIS tier — surface it as
          // a retryable RendererError so the fallback loop / breaker can react.
          if html.trim().is_empty() {
+@@ -340,7 +367,7 @@ mod tests {
+     use wiremock::{Mock, MockServer, ResponseTemplate};
+ 
+     fn renderer(base_url: &str) -> CamoufoxRenderer {
+-        CamoufoxRenderer::new("camoufox", base_url, "", 30_000)
++        CamoufoxRenderer::new("camoufox", base_url, "", 30_000, 20_000)
+     }
+ 
+     fn deadline() -> Deadline {
+@@ -534,7 +561,9 @@ mod tests {
+             .await;
+         mount_delete_session(&server).await;
+ 
+-        let r = renderer(&server.uri());
++        // Tiny challenge_wait so the wall-never-clears case fails fast in CI
++        // instead of polling for the full production budget.
++        let r = CamoufoxRenderer::new("camoufox", &server.uri(), "", 30_000, 50);
+         let err = r
+             .fetch("https://example.com", &HashMap::new(), None, deadline())
+             .await
+diff --git a/crates/crw-renderer/src/lib.rs b/crates/crw-renderer/src/lib.rs
+index 8bfbc57..3a90fe8 100644
+--- a/crates/crw-renderer/src/lib.rs
++++ b/crates/crw-renderer/src/lib.rs
+@@ -991,6 +991,7 @@ impl FallbackRenderer {
+                     &cf.base_url,
+                     &cf.api_key,
+                     config.camoufox_timeout(),
++                    config.camoufox_challenge_wait(),
+                 )) as Arc<dyn PageFetcher>);
+                 tracing::info!(
+                     base_url = %cf.base_url,
