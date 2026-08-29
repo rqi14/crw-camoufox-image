@@ -7,6 +7,16 @@ for `crw-server` to talk to a [`camofox-browser`](https://github.com/redf0x1/cam
 sidecar (`[renderer.camoufox]` in `config.toml`), which is the only renderer
 tier that can pass Cloudflare-style fingerprint/bot challenges.
 
+## Patches
+
+Every `*.patch` in the repo root is applied to the freshly-cloned upstream at
+build time, in filename order.
+
+| Patch | What it adds |
+|---|---|
+| `wait-for-challenge.patch` | `renderer.camoufox_challenge_wait_ms` — polls a Camoufox tab while a Cloudflare-style JS challenge clears instead of evaluating once and returning the interstitial. Env: `CRW_RENDERER__CAMOUFOX_CHALLENGE_WAIT_MS`. |
+| `configurable-escalation.patch` | `extraction.lightpanda_escalation_renderer` — the renderer forced when a LightPanda-tier fetch returns thin content. Upstream hardcodes `"chrome"` (`crw-crawl/src/single.rs`), so a deployment without a Chrome CDP sidecar gets `requested renderer 'chrome' not in pool` and never reaches stronger tiers like camoufox. Defaults to `"chrome"` — unchanged behaviour unless set. Env: `CRW_EXTRACTION__LIGHTPANDA_ESCALATION_RENDERER`. |
+
 No source is forked or modified — the workflow clones upstream `us/crw` at
 build time and rebuilds their own `Dockerfile` with one extra `--build-arg`
 (`CARGO_PKGS=-p crw-server --features cdp,camoufox -p crw-mcp -p crw-cli`).

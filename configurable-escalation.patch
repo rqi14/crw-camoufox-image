@@ -1,0 +1,53 @@
+diff --git a/crates/crw-core/src/config.rs b/crates/crw-core/src/config.rs
+index 63fc667..f4758b4 100644
+--- a/crates/crw-core/src/config.rs
++++ b/crates/crw-core/src/config.rs
+@@ -1608,6 +1608,16 @@ pub struct ExtractionConfig {
+     /// returns SPA husks of 90–500B that pass HTML-shape checks).
+     #[serde(default = "default_lightpanda_retry_threshold")]
+     pub lightpanda_retry_threshold_bytes: usize,
++    /// Renderer forced on a post-extract escalation when the prior tier was
++    /// LightPanda. Upstream hardcodes `"chrome"`; on a deployment that runs no
++    /// Chrome CDP sidecar that turns the escalation into a dead end — the pool
++    /// rejects it ("requested renderer 'chrome' not in pool") and stronger
++    /// tiers such as camoufox are never reached, even when configured and
++    /// healthy. Overridable so the escalation can point at whatever tier the
++    /// deployment actually has.
++    /// Env: `CRW_EXTRACTION__LIGHTPANDA_ESCALATION_RENDERER`.
++    #[serde(default = "default_lightpanda_escalation_renderer")]
++    pub lightpanda_escalation_renderer: String,
+     /// Process-wide cap on concurrent HTML → markdown extractions (html5ever +
+     /// htmd). Extraction is CPU-bound and runs on the blocking pool; this bound
+     /// keeps a burst of concurrent scrapes from oversubscribing the cores and
+@@ -1640,6 +1650,10 @@ fn default_lightpanda_retry_threshold() -> usize {
+     2000
+ }
+ 
++fn default_lightpanda_escalation_renderer() -> String {
++    "chrome".to_string()
++}
++
+ fn default_max_concurrent_extracts() -> usize {
+     let cpus = std::thread::available_parallelism()
+         .map(|n| n.get())
+@@ -1657,6 +1671,7 @@ impl Default for ExtractionConfig {
+             llm_fallback: LlmFallbackConfig::default(),
+             http_retry_threshold_bytes: default_http_retry_threshold(),
+             lightpanda_retry_threshold_bytes: default_lightpanda_retry_threshold(),
++            lightpanda_escalation_renderer: default_lightpanda_escalation_renderer(),
+             max_concurrent_extracts: default_max_concurrent_extracts(),
+             reserved_interactive_extracts: None,
+             normalize_tables: false,
+diff --git a/crates/crw-crawl/src/single.rs b/crates/crw-crawl/src/single.rs
+index 00ae3f4..382c811 100644
+--- a/crates/crw-crawl/src/single.rs
++++ b/crates/crw-crawl/src/single.rs
+@@ -456,7 +456,7 @@ async fn scrape_url_inner(
+             // Otherwise (http tier), let the chain decide so chrome can be reached
+             // through the existing failover path.
+             let escalation_target: Option<&str> = if prior_renderer == Some("lightpanda") {
+-                Some("chrome")
++                Some(extraction_cfg.lightpanda_escalation_renderer.as_str())
+             } else {
+                 pinned
+             };
