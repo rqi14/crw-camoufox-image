@@ -22,7 +22,10 @@ jobs:
       # 新增一个补丁只需放个文件，不用再改这里。
       - name: Apply patches
         run: |
-          for p in ../*.patch; do
+          shopt -s nullglob
+          patches=("$GITHUB_WORKSPACE"/*.patch)
+          if [ ${#patches[@]} -eq 0 ]; then echo "no patches found"; exit 1; fi
+          for p in "${patches[@]}"; do
             echo "applying $p"
             git -C upstream apply --verbose "$p"
           done
