@@ -1,5 +1,32 @@
+diff --git a/crates/crw-core/src/error.rs b/crates/crw-core/src/error.rs
+index a9d1bc8..7fceddc 100644
+--- a/crates/crw-core/src/error.rs
++++ b/crates/crw-core/src/error.rs
+@@ -20,6 +20,14 @@ pub enum CrwError {
+     #[error("Extraction error: {0}")]
+     ExtractionError(String),
+ 
++    /// The origin returned a body that is neither HTML nor a document crw can
++    /// parse (a ZIP-container office file, an image, an archive). Distinct from
++    /// `HttpError` because it must NOT escalate to the JS renderer ladder: no
++    /// browser turns a .docx into a page, so climbing the ladder only burns a
++    /// Chromium/Camoufox session before failing anyway.
++    #[error("Unsupported content type: {0}")]
++    UnsupportedContentType(String),
++
+     #[error("Crawl error: {0}")]
+     CrawlError(String),
+ 
+@@ -58,6 +66,7 @@ impl CrwError {
+             CrwError::InvalidRequest(_) => "invalid_request",
+             CrwError::RendererError(_) => "renderer_error",
+             CrwError::ExtractionError(_) => "extraction_error",
++            CrwError::UnsupportedContentType(_) => "unsupported_content_type",
+             CrwError::CrawlError(_) => "crawl_error",
+             CrwError::Timeout(_) => "timeout",
+             CrwError::ConfigError(_) => "config_error",
 diff --git a/crates/crw-renderer/src/http_only.rs b/crates/crw-renderer/src/http_only.rs
-index 205390c..4bbb004 100644
+index 205390c..4ccb2fe 100644
 --- a/crates/crw-renderer/src/http_only.rs
 +++ b/crates/crw-renderer/src/http_only.rs
 @@ -913,7 +913,7 @@ impl PageFetcher for HttpFetcher {
@@ -33,8 +60,8 @@ index 205390c..4bbb004 100644
 +        let (html, raw_bytes) = if is_pdf || sniffed_pdf {
              (String::new(), Some(bytes.to_vec()))
 +        } else if looks_binary(&bytes, header_charset.as_deref()) {
-+            return Err(CrwError::HttpError(format!(
-+                "Non-text response body ({}, {} bytes): not HTML and not a PDF, \
++            return Err(CrwError::UnsupportedContentType(format!(
++                "{} ({} bytes): not HTML and not a PDF, \
 +                 so there is nothing to extract",
 +                content_type.as_deref().unwrap_or("no content-type"),
 +                bytes.len()
@@ -97,3 +124,72 @@ index 205390c..4bbb004 100644
      /// Guards every test below that mutates process-wide env vars
      /// (`CRW_HTTP_TLS_RELAXED_FALLBACK`, `CRW_HTTP_RATELIMIT_PROXY_URL`,
      /// `HTTP_PROXY`/etc, `CRW_ALLOW_LOOPBACK_FOR_TESTS`). `cargo test` runs
+diff --git a/crates/crw-renderer/src/lib.rs b/crates/crw-renderer/src/lib.rs
+index 8bfbc57..3941ff8 100644
+--- a/crates/crw-renderer/src/lib.rs
++++ b/crates/crw-renderer/src/lib.rs
+@@ -1589,7 +1589,16 @@ impl FallbackRenderer {
+                     .await
+                 {
+                     Ok(r) => r,
+-                    Err(e) if !self.js_renderers.is_empty() => {
++                    // `UnsupportedContentType` is excluded on purpose: it means
++                    // the body is not a web page at all (a .docx ZIP, an image),
++                    // which no renderer can fix. Escalating one costs a full
++                    // lightpanda -> chrome -> camoufox climb (measured ~23s and a
++                    // Camoufox session) and still fails, with the precise content
++                    // type lost behind the ladder's generic "no usable content".
++                    Err(e)
++                        if !self.js_renderers.is_empty()
++                            && !matches!(e, CrwError::UnsupportedContentType(_)) =>
++                    {
+                         tracing::info!(
+                             url,
+                             error = %e,
+@@ -1741,7 +1750,16 @@ impl FallbackRenderer {
+                     .await
+                 {
+                     Ok(r) => r,
+-                    Err(e) if !self.js_renderers.is_empty() => {
++                    // `UnsupportedContentType` is excluded on purpose: it means
++                    // the body is not a web page at all (a .docx ZIP, an image),
++                    // which no renderer can fix. Escalating one costs a full
++                    // lightpanda -> chrome -> camoufox climb (measured ~23s and a
++                    // Camoufox session) and still fails, with the precise content
++                    // type lost behind the ladder's generic "no usable content".
++                    Err(e)
++                        if !self.js_renderers.is_empty()
++                            && !matches!(e, CrwError::UnsupportedContentType(_)) =>
++                    {
+                         tracing::info!(
+                             url,
+                             error = %e,
+diff --git a/crates/crw-server/src/error.rs b/crates/crw-server/src/error.rs
+index 25b579f..28c8878 100644
+--- a/crates/crw-server/src/error.rs
++++ b/crates/crw-server/src/error.rs
+@@ -45,6 +45,7 @@ impl IntoResponse for AppError {
+             CrwError::HttpError(_) => StatusCode::BAD_GATEWAY,
+             CrwError::TargetUnreachable(_) => StatusCode::UNPROCESSABLE_ENTITY,
+             CrwError::ExtractionError(_) => StatusCode::UNPROCESSABLE_ENTITY,
++            CrwError::UnsupportedContentType(_) => StatusCode::UNPROCESSABLE_ENTITY,
+             CrwError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
+             CrwError::SearchDisabled(_) => StatusCode::SERVICE_UNAVAILABLE,
+             CrwError::SearchDegraded(_) => StatusCode::SERVICE_UNAVAILABLE,
+@@ -76,6 +77,16 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn app_error_unsupported_content_type_422_not_500() {
++        // Must be an explicit arm: the `_` fallback would report a .docx as a
++        // 500, blaming the server for the origin's media type.
++        assert_eq!(
++            status_for(CrwError::UnsupportedContentType("application/zip".into())),
++            StatusCode::UNPROCESSABLE_ENTITY
++        );
++    }
++
+     #[test]
+     fn app_error_not_found_404() {
+         assert_eq!(
