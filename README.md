@@ -16,7 +16,10 @@ build time, in filename order.
 |---|---|
 | `wait-for-challenge.patch` | `renderer.camoufox_challenge_wait_ms` — polls a Camoufox tab while a Cloudflare-style JS challenge clears instead of evaluating once and returning the interstitial. Env: `CRW_RENDERER__CAMOUFOX_CHALLENGE_WAIT_MS`. |
 | `configurable-escalation.patch` | `extraction.lightpanda_escalation_renderer` — the renderer forced when a LightPanda-tier fetch returns thin content. Upstream hardcodes `"chrome"` (`crw-crawl/src/single.rs`), so a deployment without a Chrome CDP sidecar gets `requested renderer 'chrome' not in pool` and never reaches stronger tiers like camoufox. Defaults to `"chrome"` — unchanged behaviour unless set. Env: `CRW_EXTRACTION__LIGHTPANDA_ESCALATION_RENDERER`. |
-| `reject-binary-bodies.patch` | Bug fix, no new config. `crw-renderer/src/http_only.rs` keys its PDF branch on `content_type == "application/pdf"` and treats **everything else** as text, so a non-HTML non-PDF body is UTF-8-lossy'd into the HTML extractor: a `.docx`/`.xlsx`/`.pptx` returns `markdown` starting `PK...[Content_Types].xml` under `success: true`, indistinguishable from a real scrape. Now a `%PDF-` magic sniff relabels mislabelled PDFs (so the crw-crawl PDF branch engages), and a NUL-byte-in-first-1KB check (skipped when the header declares a wide charset) raises a new `CrwError::UnsupportedContentType` &rarr; HTTP 422. That variant is excluded from both JS-renderer escalation gates in `lib.rs`: no browser turns a `.docx` into a page, so climbing lightpanda&rarr;chrome&rarr;camoufox only burns ~23s and a Camoufox session before failing anyway. Proposed upstream. |
+
+`reject-binary-bodies.patch` was **merged upstream** (`ab5e93e`, refined by
+`4f741d5`) and dropped here on 2026-09-04: upstream now ships the `%PDF-`
+magic sniff and the `CrwError::UnsupportedContentType` → HTTP 422 path itself.
 
 No source is forked or modified — the workflow clones upstream `us/crw` at
 build time and rebuilds their own `Dockerfile` with one extra `--build-arg`
